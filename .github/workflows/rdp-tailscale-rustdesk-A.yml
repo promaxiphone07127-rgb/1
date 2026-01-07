@@ -1,19 +1,62 @@
-- name: Launch RustDesk (foreground) + Screenshot to Gofile
+name: RDP + Tailscale (B) — NO RustDesk
+on:
+  workflow_dispatch:
+    inputs:
+      ts_authkey: { description: "Tailscale Auth key", required: true }
+      rdp_count:  { description: "Instances (1-10)", default: "1" }
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: pwsh
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.mk.outputs.matrix }}
+    steps:
+      - id: mk
         run: |
-          $rdExe = "C:\Program Files\RustDesk\rustdesk.exe"
-          Start-Process -FilePath $rdExe -ErrorAction SilentlyContinue
-          Start-Sleep -Seconds 5
+          $n=[int]"${{ inputs.rdp_count }}"; if($n -lt 1){$n=1}; if($n -gt 10){$n=10}
+          $inc=@(); for($i=1;$i -le $n;$i++){ $inc+=@{id=$i} }
+          @{include=$inc}|ConvertTo-Json -Compress |
+            %{ "matrix=$_"} | Out-File $env:GITHUB_OUTPUT -Append
 
-          $screenshotPath = "$env:TEMP\rustdesk_${{ matrix.id }}.png"
-          Add-Type -AssemblyName System.Windows.Forms
-          Add-Type -AssemblyName System.Drawing
-          $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
-          $bitmap = New-Object System.Drawing.Bitmap $bounds.Width, $bounds.Height
-          $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
-          $graphics.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-          $bitmap.Save($screenshotPath, [System.Drawing.Imaging.ImageFormat]::Png)
-          $graphics.Dispose(); $bitmap.Dispose()
+  rdp:
+    needs: setup
+    runs-on: windows-latest
+    strategy:
+      matrix: ${{ fromJson(needs.setup.outputs.matrix) }}
+    timeout-minutes: 360
+    env:
+      RDP_USER: Bullettemporary
+      RDP_PASS: Bullet@12345
 
-          $curlResult = curl -F "file=@$screenshotPath" https://store1.gofile.io/uploadFile
-          $json = $curlResult | ConvertFrom-Json
-          if ($json.status -eq "ok") { "SCREENSHOT_URL=$($json.data.downloadPage)" | Out-File -Append $env:GITHUB_ENV }
+    steps:
+      - name: Install + Up Tailscale
+        run: |
+          $ts="$env:ProgramFiles\Tailscale\tailscale.exe"
+          if(-not(Test-Path $ts)){
+            $msi="$env:TEMP\tailscale.msi"
+            Invoke-WebRequest https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi -OutFile $msi
+            Start-Process msiexec.exe -ArgumentList "/i","`"$msi`"","/quiet","/norestart" -Wait
+          }
+          & $ts up --authkey "${{ inputs.ts_authkey }}" --hostname "bullet${{ matrix.id }}"
+          & $ts ip -4
+
+      - name: Enable RDP
+        run: |
+          $u=$env:RDP_USER; $p=$env:RDP_PASS
+          $sec=ConvertTo-SecureString $p -AsPlainText -Force
+          New-LocalUser -Name $u -Password $sec -AccountNeverExpires -EA SilentlyContinue
+          Add-LocalGroupMember -Group Administrators -Member $u -EA SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -EA SilentlyContinue
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" fDenyTSConnections 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+      - name: Keep alive
+        run: |
+          Start-Sleep -Seconds 21600
